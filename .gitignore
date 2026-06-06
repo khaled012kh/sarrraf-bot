@@ -1,0 +1,8 @@
+# ملفات حساسة
+.env
+rates_cache.json
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
