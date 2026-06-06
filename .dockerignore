@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.env
+rates_cache.json
+.venv
+venv
+*.log
+.git
