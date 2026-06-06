@@ -2,15 +2,17 @@
 🤖 بوت صرّاف - محول العملات الذكي
 Telegram Currency Converter Bot
 - يدعم 161+ عملة عالمية
-- تحديث تلقائي للأسعار كل ساعة
+- تحديث تلقائي للأسعار كل ساعة (عند كل استخدام)
 - واجهة عربية بالكامل
 - بدون مفتاح API
+- بدون JobQueue (متوافق مع كل البيئات)
 """
 
 import os
 import json
 import logging
 import asyncio
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 
@@ -127,9 +129,8 @@ def convert(amount: float, from_cur: str, to_cur: str, rates: dict) -> float | N
 
 
 # ====================== تحديث الأسعار التلقائي ======================
-async def update_rates_job(context: ContextTypes.DEFAULT_TYPE):
-    """مهمة دورية لتحديث الأسعار - مجاني 100%"""
-    import aiohttp
+async def fetch_rates() -> dict | None:
+    """جلب الأسعار من الـ API - مجاني 100%"""
     # لو فيه مفتاح نستخدم الـ API الرسمي، لو مفيش نستخدم المجاني العام
     if EXCHANGE_API_KEY and EXCHANGE_API_KEY != "PUT_YOUR_EXCHANGE_RATE_API_KEY_HERE":
         url = PRIMARY_API_URL.format(key=EXCHANGE_API_KEY)
@@ -137,8 +138,9 @@ async def update_rates_job(context: ContextTypes.DEFAULT_TYPE):
         url = FREE_API_URL
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as resp:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
                 data = await resp.json()
                 # المصدر المجاني بيرجع "result": "success" + rates مباشرة
                 # المصدر الرسمي بيرجع "result": "success" + conversion_rates
@@ -146,16 +148,69 @@ async def update_rates_job(context: ContextTypes.DEFAULT_TYPE):
                     rates_data = data.get("conversion_rates") or data.get("rates", {})
                     payload = {
                         "rates": rates_data,
-                        "last_update": data.get("time_last_update_unix", 0) or data.get("time_last_update", 0),
-                        "next_update": data.get("time_next_update_unix", 0) or data.get("time_next_update", 0),
+                        "last_update": data.get("time_last_update_unix", 0) or int(datetime.now().timestamp()),
+                        "next_update": data.get("time_next_update_unix", 0),
                         "base": "USD",
                     }
                     save_rates(payload)
-                    logger.info(f"✅ تم تحديث أسعار العملات - {len(rates_data)} عملة")
+                    return payload
                 else:
                     logger.error(f"❌ فشل التحديث: {data.get('error-type', 'unknown error')}")
+                    return None
     except Exception as e:
         logger.error(f"❌ خطأ في تحديث الأسعار: {e}")
+        return None
+
+
+def ensure_fresh_rates(max_age_seconds: int = 3600) -> dict:
+    """تأكد إن الأسعار محدّثة (أو ارجع اللي عندنا)"""
+    rates = load_rates()
+    last_update = rates.get("last_update", 0)
+    now = datetime.now().timestamp()
+    if rates.get("rates") and (now - last_update) < max_age_seconds:
+        return rates
+    # البيانات قديمة أو مش موجودة، نجيبها
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    try:
+        new_rates = loop.run_until_complete(fetch_rates())
+    except Exception:
+        new_rates = None
+    if new_rates:
+        return new_rates
+    return rates  # ارجع القديم لو النت مش شغال
+
+
+def ensure_rates_sync() -> dict:
+    """تأكد إن عندنا أسعار (sync)"""
+    rates = load_rates()
+    if rates.get("rates"):
+        return rates
+    # مفيش أسعار محفوظة، جلب sync
+    try:
+        import urllib.request
+        if EXCHANGE_API_KEY and EXCHANGE_API_KEY != "PUT_YOUR_EXCHANGE_RATE_API_KEY_HERE":
+            url = PRIMARY_API_URL.format(key=EXCHANGE_API_KEY)
+        else:
+            url = FREE_API_URL
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("result") == "success" or "rates" in data:
+                rates_data = data.get("conversion_rates") or data.get("rates", {})
+                payload = {
+                    "rates": rates_data,
+                    "last_update": data.get("time_last_update_unix", 0) or int(datetime.now().timestamp()),
+                    "next_update": data.get("time_next_update_unix", 0),
+                    "base": "USD",
+                }
+                save_rates(payload)
+                return payload
+    except Exception as e:
+        logger.error(f"❌ خطأ في جلب الأسعار: {e}")
+    return rates
 
 
 # ====================== لوحة المفاتيح ======================
@@ -217,7 +272,8 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
 # ====================== أوامر البوت ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    rates = load_rates()
+    # تحديث الأسعار عند بدء الاستخدام
+    rates = ensure_fresh_rates()
     last_update = "غير معروف"
     if rates and rates.get("last_update"):
         last_update = datetime.fromtimestamp(rates["last_update"]).strftime("%Y-%m-%d %H:%M")
@@ -333,12 +389,13 @@ async def amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from_cur = context.user_data["from_currency"]
     to_cur = context.user_data["to_currency"]
-    rates = load_rates().get("rates", {})
+    # تحديث الأسعار تلقائياً مع كل عملية تحويل
+    rates = ensure_fresh_rates().get("rates", {})
 
     if not rates:
         await update.message.reply_text(
             "⚠️ مفيش أسعار متاحة دلوقتي. استنى دقيقة وجرب تاني،"
-            " أو تأكد إن الـ API key متظبوط."
+            " أو تأكد إن النت شغّال."
         )
         return ConversationHandler.END
 
@@ -402,7 +459,8 @@ async def quick_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ المبلغ غلط")
         return
 
-    rates = load_rates().get("rates", {})
+    # تحديث الأسعار تلقائياً
+    rates = ensure_fresh_rates().get("rates", {})
     if not rates:
         await update.message.reply_text("⚠️ الأسعار غير متاحة دلوقتي")
         return
@@ -432,7 +490,8 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     code = context.args[0].upper()
-    rates = load_rates().get("rates", {})
+    # تحديث الأسعار تلقائياً
+    rates = ensure_fresh_rates().get("rates", {})
     if code not in rates:
         await update.message.reply_text(f"❌ كود العملة `{code}` مش موجود.")
         return
@@ -467,7 +526,8 @@ async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def popular_currencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """عرض أشهر العملات وأسعارها"""
-    rates = load_rates().get("rates", {})
+    # تحديث الأسعار تلقائياً
+    rates = ensure_fresh_rates().get("rates", {})
     if not rates:
         await update.message.reply_text("⚠️ الأسعار غير متاحة.")
         return
@@ -493,6 +553,8 @@ def main():
     if BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
         print("❌ لازم تحط BOT_TOKEN في متغير البيئة أو تعدّل الكود")
         return
+    if BOT_TOKEN == "8928361588:AAHkkxvEcYjJw9ZyLha9gqLsiAXpvMGTHNM":
+        print("⚠️  أنت شغّال بالتوكن الافتراضي - غيّره في الكود لو ده مش بتاعك")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -528,10 +590,10 @@ def main():
         quick_convert,
     ))
 
-    # جدولة تحديث الأسعار كل ساعة
-    app.job_queue.run_repeating(update_rates_job, interval=UPDATE_INTERVAL, first=10)
-    # تحديث فوري عند البدء
-    app.job_queue.run_once(update_rates_job, when=5)
+    # تحديث الأسعار عند البدء (sync)
+    print("⏳ جاري جلب أحدث أسعار العملات...")
+    ensure_rates_sync()
+    print("✅ تم جلب الأسعار")
 
     print("✅ البوت شغال...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
